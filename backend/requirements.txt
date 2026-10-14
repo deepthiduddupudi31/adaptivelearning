@@ -7,3 +7,4 @@ google-genai>=1,<2
 pypdf>=5,<6
 python-multipart>=0.0.9
 sentence-transformers
+python-jose[cryptography]
