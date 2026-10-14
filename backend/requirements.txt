@@ -6,3 +6,4 @@ pgvector>=0.3,<1
 google-genai>=1,<2
 pypdf>=5,<6
 python-multipart>=0.0.9
+sentence-transformers
