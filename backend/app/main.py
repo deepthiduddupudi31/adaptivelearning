@@ -389,7 +389,7 @@ def signup(body: SignupBody):
 
 
 
-          if not re.fullmatch(r"[^@\s]+@[^@\s]+\\.[^@\s]+", email):
+          if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
 
 
 
