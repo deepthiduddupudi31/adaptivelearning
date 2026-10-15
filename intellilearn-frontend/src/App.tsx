@@ -53,7 +53,7 @@ import remarkMath from "remark-math";
 
 import rehypeKatex from "rehype-katex";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL || "https://adaptivelearningnew.onrender.com"
 
 type Page =
 
