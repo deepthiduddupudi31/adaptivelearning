@@ -287,6 +287,8 @@ async def require_jwt_for_application_routes(request: Request, call_next):
 
                               "http://127.0.0.1:5173",
 
+                              "https://adaptivelearning-psi.vercel.app"
+
 
 
                     }
