@@ -6,27 +6,30 @@ from google import genai
 from google.genai import types
 from pgvector.psycopg import register_vector
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 
 from .config import settings
 from .db import get_connection
 
 
-MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
+MODEL_NAME = "gemini-embedding-001"
 EMBEDDING_DIMENSION = 768
 DEFAULT_TOP_K = 5
 
-_model = None
+_embedding_client = None
 
 
-def get_embedding_model():
-    """Load the sentence-transformers model once per process."""
-    global _model
+def get_embedding_client():
+    """Create and reuse the Gemini API client for embeddings."""
+    global _embedding_client
 
-    if _model is None:
-        _model = SentenceTransformer(MODEL_NAME)
+    if _embedding_client is None:
+        if not settings.gemini_api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not configured. Add it to backend/.env."
+            )
+        _embedding_client = genai.Client(api_key=settings.gemini_api_key)
 
-    return _model
+    return _embedding_client
 
 
 def chunks(text, size=900, overlap=120):
@@ -202,27 +205,60 @@ def backfill_missing_topics():
     return results
 
 
-def _generate_embeddings(texts):
-    """Generate normalized 768-dimensional embeddings for a list of texts."""
+def _generate_embeddings(
+    texts,
+    batch_size=4,
+    task_type="RETRIEVAL_DOCUMENT",
+):
+    """Generate normalized 768-dimensional embeddings using Gemini."""
+    import numpy as np
+
     if not texts:
-        return []
+        return np.empty((0, EMBEDDING_DIMENSION), dtype=np.float32)
 
-    model = get_embedding_model()
-    embeddings = model.encode(
-        texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size < 1
+    ):
+        raise ValueError("batch_size must be a positive integer.")
 
-    if embeddings.ndim != 2 or embeddings.shape[1] != EMBEDDING_DIMENSION:
-        actual = embeddings.shape[1] if embeddings.ndim == 2 else "unknown"
-        raise ValueError(
-            f"Expected embeddings with {EMBEDDING_DIMENSION} dimensions, "
-            f"got {actual}."
+    client = get_embedding_client()
+    all_embeddings = []
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        response = client.models.embed_content(
+            model=MODEL_NAME,
+            contents=batch,
+            config=types.EmbedContentConfig(
+                output_dimensionality=EMBEDDING_DIMENSION,
+                task_type=task_type,
+            ),
         )
 
-    return embeddings
+        if not response.embeddings:
+            raise RuntimeError("Gemini returned no embeddings.")
+
+        vectors = [item.values for item in response.embeddings]
+        embeddings = np.asarray(vectors, dtype=np.float32)
+        expected_shape = (len(batch), EMBEDDING_DIMENSION)
+
+        if embeddings.ndim != 2 or embeddings.shape != expected_shape:
+            raise ValueError(
+                f"Expected embedding shape {expected_shape}, "
+                f"got {embeddings.shape}."
+            )
+
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        if np.any(norms == 0):
+            raise ValueError("Gemini returned a zero embedding.")
+
+        # Normalize so cosine similarity behaves consistently in pgvector.
+        embeddings = embeddings / norms
+        all_embeddings.append(embeddings)
+
+    return np.concatenate(all_embeddings, axis=0)
 
 
 def backfill_missing_embeddings(batch_size=32):
@@ -234,7 +270,6 @@ def backfill_missing_embeddings(batch_size=32):
         raise ValueError("batch_size must be a positive integer.")
 
     updated = 0
-    model = get_embedding_model()
 
     while True:
         with get_connection() as conn:
@@ -254,7 +289,7 @@ def backfill_missing_embeddings(batch_size=32):
             if not rows:
                 break
 
-            embeddings = _generate_embeddings([row["content"] for row in rows])
+            embeddings = _generate_embeddings([row["content"] for row in rows], batch_size=batch_size)
 
             for row, embedding in zip(rows, embeddings):
                 conn.execute(
@@ -270,6 +305,54 @@ def backfill_missing_embeddings(batch_size=32):
             updated += len(rows)
 
     return {"embedded_chunks": updated}
+
+
+def rebuild_all_embeddings(batch_size=4):
+    """
+    Recompute every stored chunk embedding using the configured model.
+    Updates only document_chunks.embedding and preserves all other records.
+    Required when switching embedding models, even if both output 768 dimensions.
+    """
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer.")
+
+    updated = 0
+    last_id = None
+
+    while True:
+        with get_connection() as conn:
+            register_vector(conn)
+
+            if last_id is None:
+                rows = conn.execute(
+                    "SELECT id, content FROM document_chunks ORDER BY id LIMIT %s",
+                    (batch_size,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, content FROM document_chunks WHERE id > %s ORDER BY id LIMIT %s",
+                    (last_id, batch_size),
+                ).fetchall()
+
+            if not rows:
+                break
+
+            embeddings = _generate_embeddings(
+                [row["content"] for row in rows],
+                batch_size=batch_size,
+            )
+
+            for row, embedding in zip(rows, embeddings):
+                conn.execute(
+                    "UPDATE document_chunks SET embedding = %s WHERE id = %s",
+                    (embedding, row["id"]),
+                )
+
+            conn.commit()
+            last_id = rows[-1]["id"]
+            updated += len(rows)
+
+    return {"reembedded_chunks": updated}
 
 
 def ingest_pdf(filename, raw):
@@ -383,13 +466,11 @@ def retrieve_context(query, top_k=DEFAULT_TOP_K):
             "message": "top_k must be a positive integer.",
         }
 
-    model = get_embedding_model()
-    query_embedding = model.encode(
-        query,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    query_embedding = _generate_embeddings(
+        [query],
+        batch_size=1,
+        task_type="RETRIEVAL_QUERY",
+    )[0]
 
     if len(query_embedding) != EMBEDDING_DIMENSION:
         raise ValueError(
